@@ -65,6 +65,31 @@ def processed_files(database):
     }
 
 
+
+def split_files(ethnicity, greek_names, path):
+
+    names = set(greek_names)
+    output_p = f"{ethnicity}_files"
+    os.makedirs(output_p, exist_ok=True)
+
+    files = [f.name for f in os.scandir(path) if f.name.endswith(".jsonl.gz")]
+
+    for i, file in enumerate(files):
+        with gzip.open(f"{path}/{file}", "rt", encoding="utf-8") as f, \
+             gzip.open(f"{output_p}/{ethnicity}{i}.jsonl.gz", "wt", encoding="utf-8") as out:
+            for jsonl in f:
+                work = json.loads(jsonl)
+                for author in work.get("author", []):
+                    given = author.get("given")
+                    family = author.get("family")
+                    if (given, family) in names:
+                        out.write(jsonl)
+                        break
+        print(f"\r{i + 1}/{len(files)} files filtered", end="", flush=True)
+    return output_p
+    
+
+
 def extract_names(path, database):
     """
     Extracts author names from the compressed files that have not been read
@@ -272,9 +297,13 @@ def main():
         classify_names(database, names)
     mark_processed(database, read_files)
 
-    print(f"{len(filter_names(database, ethnicity))} {ethnicity} names")
+    greek_names = filter_names(database, ethnicity)
+    print(f"{len(greek_names)} {ethnicity} names")
+    
+
+    output_p = split_files(ethnicity, greek_names, path)
     print("populating names using a3k")
-    populate_database(ethnicity, path)
+    populate_database(ethnicity, output_p)
 
 
 if __name__ == "__main__":

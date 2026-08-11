@@ -8,3 +8,4 @@ __pycache__
 .DS_Store
 benchmark*.py
 *.csv
+/*_files
