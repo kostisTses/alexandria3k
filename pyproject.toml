@@ -32,6 +32,17 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
+[project.optional-dependencies]
+author-disambiguation = [
+  "igraph",
+  "leidenalg",
+  "rapidfuzz",
+  "datasketch",
+  "scikit-learn",
+  "celery"
+]
+
+
 [project.urls]
 "Homepage" = "https://github.com/dspinellis/alexandria3k"
 "Repository" = "https://github.com/dspinellis/alexandria3k.git"
@@ -40,3 +51,4 @@ classifiers = [
 
 [project.scripts]
 a3k = "alexandria3k.__main__:main"
+

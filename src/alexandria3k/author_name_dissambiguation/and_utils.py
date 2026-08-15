@@ -1,8 +1,7 @@
-from itertools import groupby
+
 from typing import NamedTuple
 import unicodedata
 
-from rapidfuzz.distance import JaroWinkler
 from datasketch import MinHash
 from sklearn.feature_extraction.text import CountVectorizer
 

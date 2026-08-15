@@ -22,7 +22,7 @@ import leidenalg
 
 from alexandria3k.common import ensure_table_exists, log_sql, set_fast_writing
 
-from alexandria3k.author_name_disambiguation_utils import normalized
+from alexandria3k.author_name_dissambiguation.and_utils import normalized
 
 # from alexandria3k import perf
 from alexandria3k.db_schema import ColumnMeta, TableMeta

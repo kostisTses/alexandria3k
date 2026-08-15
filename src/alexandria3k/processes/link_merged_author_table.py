@@ -23,7 +23,7 @@ from rapidfuzz.distance import JaroWinkler
 
 from alexandria3k.common import ensure_table_exists, log_sql, set_fast_writing
 
-from alexandria3k.author_name_disambiguation_utils import (
+from alexandria3k.author_name_dissambiguation.and_utils import (
     Author,
     UnionFind,
     jaccard_similarity,
