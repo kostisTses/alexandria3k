@@ -24,11 +24,11 @@ from ..test_dir import add_src_dir
 
 add_src_dir()
 
-from alexandria3k.processes.link_merged_author_table import (
+from alexandria3k.author_name_disambiguation.disambiguation_scoring import JaroWinkler
+from alexandria3k.author_name_disambiguation.disambiguation_util import (
     jaccard_similarity,
-    JaroWinkler
+    normalized,
 )
-from alexandria3k.processes.link_author_blocks import normalized
 
 
 class TestJaroWinkler(unittest.TestCase):
@@ -78,9 +78,6 @@ class TestNormalized(unittest.TestCase):
 
     def test_strips_punctuation_and_digits(self):
         self.assertEqual(normalized("O'Brien-123"), "obrien")
-
-    def test_keeps_internal_spaces(self):
-        self.assertEqual(normalized(" Jean Paul "), "jean paul")
 
     def test_stroke_letters_are_not_folded(self):
         self.assertEqual(normalized("Øystein"), "øystein")

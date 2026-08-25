@@ -4,7 +4,8 @@ Process creates and links author_name_blocks table
 
 Takes input work_authors table which gets populated with Crossref metadata
 
-Process is the first phase of the author_name_disambiguation layer in alexandria3k
+First phase of the author name disambiguation pipeline, called by
+link_disambiguated_authors
 - Gets every author in the populated table
 - Normalizes name with custom function normalize()
 - Groups them on "blocks" based on that normalization function
@@ -22,7 +23,7 @@ import leidenalg
 
 from alexandria3k.common import ensure_table_exists, log_sql, set_fast_writing
 
-from alexandria3k.author_name_dissambiguation.and_utils import normalized
+from alexandria3k.author_name_disambiguation.disambiguation_util import normalized
 
 # from alexandria3k import perf
 from alexandria3k.db_schema import ColumnMeta, TableMeta
@@ -44,7 +45,7 @@ table = [
 DEFAULT_RESOLUTION = 1.0
 
 
-def build_graph(database):
+def build_communities_graph(database):
     """Build an igraph graph from the coupling work refrences."""
 
     graph_cursor = database.cursor()
@@ -105,7 +106,7 @@ def get_journal_communities(database):
     Runs leiden clustering algorithm to get the communities
     Returns a dictionary of key = journal , value = community_id
     """
-    g = build_graph(database)
+    g = build_communities_graph(database)
     community_map = run_leiden_clustering(g)
     return community_map
 
@@ -145,6 +146,8 @@ def create_author_blocks_table(database_path):
     ensure_table_exists(database, "work_references")
     ensure_table_exists(database, "works")
     # perf.log("author_blocks table created")
+
+    timer = time.perf_counter()
 
     select_cursor = database.cursor()
     insert_cursor = database.cursor()
@@ -199,16 +202,4 @@ def create_author_blocks_table(database_path):
     )
     # perf.log("created author_blocks indexes")
 
-
-def process(database_path):
-    """
-    Process creates and links the author_blocks_table with the populated dataset
-    Table consists of (work_author_id, normalised_name, normalised_family_name, work_id, block_key)
-    For each author in the database, his name will be passed through a name-normalization function,
-    based on that output each author will be put into a block with that id,
-    reducing comparisons to just each authors in the same block to distinguish.
-    block_key is consisted of the normalised_family_name + first inital of normalised name
-    """
-
-    create_author_blocks_table(database_path)
-    print("Created author_blocks table")
+    print(f"Created author_blocks {time.perf_counter() - timer}")

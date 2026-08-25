@@ -1,16 +1,12 @@
-
-from typing import NamedTuple
-import unicodedata
-
 from datasketch import MinHash
-from sklearn.feature_extraction.text import CountVectorizer
+from rapidfuzz.distance import JaroWinkler
 
-class Author(NamedTuple):
-    """One author mention within a block"""
-    id: int
-    name: str
-    work_id: int
-    community_id: int
+from alexandria3k.author_name_disambiguation.disambiguation_util import (
+    Author,
+    get_ngrams,
+    jaccard_similarity,
+)
+
 
 class Block_Attr():
     """Every attribute of a block used to compare authors together"""
@@ -30,7 +26,7 @@ class Block_Attr():
         self.venues = get_venue_per_block(self.block_key, database)
         self.min_hashes = get_min_hashes(self.co_authors)
 
-def get_min_hashes(co_authors_map: dict[int, set[str]], max_threashold=500, min_authors=10):
+def get_min_hashes(co_authors_map: dict[int, set[str]], max_threshold=500, min_authors=10):
 
     min_hash_map = {}
 
@@ -41,12 +37,12 @@ def get_min_hashes(co_authors_map: dict[int, set[str]], max_threashold=500, min_
         return {}
 
     max_coauth = max(len(co_authors) for co_authors in co_authors_map.values())
-    if max_coauth <= max_threashold:
+    if max_coauth <= max_threshold:
         return {}
 
     min_hash_map = {}
     for author_id, co_authors in co_authors_map.items():
-        if len(co_authors) > max_threashold:
+        if len(co_authors) > max_threshold:
             min_hash = MinHash(num_perm=128)
             min_hash.update_batch([c.encode("utf-8") for c in co_authors])
             min_hash_map[author_id] = min_hash
@@ -145,7 +141,7 @@ def get_venue_per_block(block_key, database):
     for work_author_id, container_title, shortened_container_title in cursor.execute(
         """
         SELECT work_author_id, works.container_title, works.short_container_title
-        FROM works 
+        FROM works
         JOIN author_name_blocks ON author_name_blocks.work_id = works.id
         WHERE author_name_blocks.block_key = ?
         """,
@@ -161,65 +157,142 @@ def get_venue_per_block(block_key, database):
     return venue_map
 
 
-# Adapted from uf-toolkit (https://github.com/hugginsc10/uf-toolkit)
-# Copyright (c) Chas Huggins
-# Licensed under the MIT License
-class UnionFind:
-    """UnionFind datastructure implementation taken from github used for merging authors together"""
+def score_affiliations(auth1, auth2, block):
+    """
+    1-3 word n-gram Jaccard similarity of two authors normalized affiliation strings
+    auth = set(author_id, author_name, author_work_id )
+    """
 
-    def __init__(self, size):
-        self.parent = [i for i in range(size)]
-        self.rank = [0] * size
+    author_1_affiliations = block.affiliations.get(auth1.id, set())
+    author_2_affiliations = block.affiliations.get(auth2.id, set())
 
-    def find(self, i):
-        if self.parent[i] != i:
-            self.parent[i] = self.find(self.parent[i])  # Path compression
-        return self.parent[i]
+    if not author_1_affiliations or not author_2_affiliations:
+        return None
 
-    def union(self, a, b):
-        rootA = self.find(a)
-        rootB = self.find(b)
-
-        if rootA != rootB:
-            # Union by rank
-            if self.rank[rootA] < self.rank[rootB]:
-                self.parent[rootA] = rootB
-            elif self.rank[rootA] > self.rank[rootB]:
-                self.parent[rootB] = rootA
-            else:
-                self.parent[rootB] = rootA
-                self.rank[rootA] += 1
-    def connected(self, a, b):
-        return self.find(a) == self.find(b)
-
-    def count_sets(self):
-        return sum(1 for i in range(len(self.parent)) if i == self.parent[i])
-
-    def get_set_elements(self, i):
-        root = self.find(i)
-        return [x for x in range(len(self.parent)) if self.find(x) == root]
+    return jaccard_similarity(author_1_affiliations, author_2_affiliations)
 
 
-def jaccard_similarity(set_a, set_b):
-    """Custom jaccard similarity used for comparing authors"""
-    if set_a and set_b:
-        union = set_a | set_b
-        jaccard = len(set_a & set_b) / len(union)
-    else:
-        jaccard = 0
+def score_venue(auth1, auth2, block):
+    """
+    Word n-gram Jaccard similarity of the venues two authors published in.
+    """
 
-    return jaccard
+    author_1_venue = block.venues.get(auth1.id, set())
+    author_2_venue = block.venues.get(auth2.id, set())
 
-def normalized(s: str):
-    """Custom normalization function used for normalizing author_names """
-    tmp = "".join(
-        c for c in unicodedata.normalize("NFKD", s)
-        if unicodedata.category(c) != "Mn" and c.isalpha() 
-    )
-    return tmp.lower().strip()
+    if not author_1_venue or not author_2_venue:
+        return None
+
+    return jaccard_similarity(author_1_venue, author_2_venue)
 
 
-ngram = CountVectorizer(ngram_range=(1, 1)).build_analyzer()
+def score_coauthors(auth1, auth2, block, weight=1.5):
+    """Jaccard similarity of two authors' co-author block-key sets"""
 
-def get_ngrams(text):
-    return set(ngram(text))
+    auth1_coauthors = block.co_authors.get(auth1.id, set())
+    auth2_coauthors = block.co_authors.get(auth2.id, set())
+
+    if not auth1_coauthors or not auth2_coauthors:
+        return None
+
+    similarity = score_min_hash(auth1, auth2, block)
+    if similarity is None:
+        similarity = jaccard_similarity(auth1_coauthors, auth2_coauthors)
+
+    return min(1.0, weight * similarity)
+
+
+def score_name_similarity(auth1, auth2, threshold=0.75):
+    """
+    Score the name similarity of 2 authors normalised_name
+    If the name is the same return 1
+    If name1 != name2 find jaroWinkler similarity
+    if jarowinkler < threshold return 0
+    """
+
+    if auth1.name == auth2.name:
+        return 1.0
+    name_similarity = JaroWinkler.similarity(auth1.name, auth2.name)
+
+    return 0 if name_similarity < threshold else name_similarity
+
+def score_min_hash(auth1, auth2, block):
+    """
+    Estimated Jaccard of two authors' co-author sets from their MinHash
+    Returns None when the block was not big enough to build them
+    """
+
+    min_hash1 = block.min_hashes.get(auth1.id)
+    min_hash2 = block.min_hashes.get(auth2.id)
+
+    if min_hash1 is None or min_hash2 is None:
+        return None
+
+    return min_hash1.jaccard(min_hash2)
+
+def check_if_co_authors(auth1, auth2):
+    """
+    Checks if 2 authors are co_authors by comparing if work_id is the same
+    """
+    return auth1.work_id == auth2.work_id
+
+
+def check_communities(auth1, auth2):
+    "Checks if 2 authors are in the same community based on journals"
+    if auth1.community_id is None or auth2.community_id is None:
+        return False
+    return auth1.community_id != auth2.community_id
+
+def check_year_gap(auth1, auth2, block, max_gap=40):
+    """
+    Get year gaps where authors made publications
+    If there is a big gap between them they are probably not the same person
+    """
+
+    year1 = block.publication_years.get(auth1.id)
+    year2 = block.publication_years.get(auth2.id)
+
+    if year1 is None or year2 is None:
+        return None
+
+    gap = abs(year1 - year2)
+    return gap > max_gap
+
+def compare_authors(
+    auth1: Author,
+    auth2: Author,
+    block: Block_Attr,
+    threshold=0.67
+):
+    """This will serve as the scoring function to determine if 2 authors are the same person.
+    The scoring function will be calculated based on a couple of criteria:
+    - Jaccard similarity on co-author sets of each author (how many co-authors they have in common)
+    - Jaro Winkler score , comparing the normalized names
+    - Affiliation/venue overlap
+    - Year gap
+    - Topic overlap using Leiden clustering
+    """
+
+    if check_communities(auth1, auth2):
+        return 0
+    if check_if_co_authors(auth1, auth2):
+        return 0
+    if check_year_gap(auth1, auth2, block):
+        return 0
+
+    name_similarity = score_name_similarity(auth1, auth2)
+    jaccard_affiliations = score_affiliations(auth1, auth2, block)
+    jaccard_coauthors = score_coauthors(auth1, auth2, block)
+    jaccard_venue = score_venue(auth1, auth2, block)
+
+    # calculate confidence score
+    scores = [
+        name_similarity,
+        jaccard_affiliations,
+        jaccard_coauthors,
+        jaccard_venue,
+    ]
+    valid_scores = [s for s in scores if s is not None]
+    avg = sum(valid_scores) / len(valid_scores)
+
+    return avg if avg >= threshold else 0

@@ -22,29 +22,30 @@ Script calls a3k --attach-databases so filtered database can be populated
 and used
 """
 
+import argparse
 import subprocess
-import time
 import gzip
 import json
 import os
-import csv
 import sys
 
 import apsw
 
-CLASSIFIER = os.path.expanduser("~/name-ethnicity-classifier")
-MODEL = "28_nationalities_english_once"
-CHUNK_IN_P = os.path.abspath("chunk.csv")
-CHUNK_OUT_P = os.path.abspath("chunk_out.csv")
-CHUNK_SIZE = 500000
+from alexandria3k.author_name_disambiguation.ethnicity_utils import (
+    CLASSIFIER,
+    MODEL,
+    classify_names,
+)
+
+WORK_DIR = "alexandria3k"
 CLASSIFICATIONS_DB = "classifications.db"
 CONFIDENCE = 95
-MIN_CONFIDENCE = 50
 
 
-def create_databases():
-    """Opens classifications.db and creates its tables when missing"""
-    database = apsw.Connection(CLASSIFICATIONS_DB)
+def create_databases(work_dir):
+    """Opens classifications.db in work_dir, creating its tables when missing"""
+    os.makedirs(work_dir, exist_ok=True)
+    database = apsw.Connection(os.path.join(work_dir, CLASSIFICATIONS_DB))
     database.execute(
         "CREATE TABLE IF NOT EXISTS classified_names "
         "(given, family, ethnicity, confidence)"
@@ -65,18 +66,21 @@ def processed_files(database):
     }
 
 
-
-def split_files(ethnicity, greek_names, path):
-
-    names = set(greek_names)
-    output_p = f"{ethnicity}_files"
+def split_files(ethnicity, ethnicity_names, path, work_dir):
+    """Copies works with an author of the ethnicity into their own files"""
+    names = set(ethnicity_names)
+    output_p = os.path.join(work_dir, f"{ethnicity}_files")
     os.makedirs(output_p, exist_ok=True)
 
     files = [f.name for f in os.scandir(path) if f.name.endswith(".jsonl.gz")]
 
     for i, file in enumerate(files):
-        with gzip.open(f"{path}/{file}", "rt", encoding="utf-8") as f, \
-             gzip.open(f"{output_p}/{ethnicity}{i}.jsonl.gz", "wt", encoding="utf-8") as out:
+        with (
+            gzip.open(f"{path}/{file}", "rt", encoding="utf-8") as f,
+            gzip.open(
+                f"{output_p}/{ethnicity}{i}.jsonl.gz", "wt", encoding="utf-8"
+            ) as out,
+        ):
             for jsonl in f:
                 work = json.loads(jsonl)
                 for author in work.get("author", []):
@@ -87,7 +91,6 @@ def split_files(ethnicity, greek_names, path):
                         break
         print(f"\r{i + 1}/{len(files)} files filtered", end="", flush=True)
     return output_p
-    
 
 
 def extract_names(path, database):
@@ -140,77 +143,6 @@ def unclassified(database, names):
     ]
 
 
-def classify_names(database, names):
-    """
-    Runs name-ethnicity-classifier on the given names
-    Processes one chunk at a time to prevent out of memory errors
-    Predictions keep the order of the names given to the classifier
-    """
-    start = time.time()
-    print("running classifier")
-    names = list(names)
-
-    for i in range(0, len(names), CHUNK_SIZE):
-        chunk_names = names[i : i + CHUNK_SIZE]
-
-        with open(CHUNK_IN_P, "w", newline="", encoding="utf-8") as chunk:
-            writer = csv.writer(chunk)
-            writer.writerow(["names"])
-            for given, family in chunk_names:
-                writer.writerow([f"{given} {family}"])
-
-        classifier = subprocess.run(
-            [
-                "python3",
-                "predict_ethnicity.py",
-                "-i",
-                CHUNK_IN_P,
-                "-o",
-                CHUNK_OUT_P,
-                "-m",
-                MODEL,
-                "-d",
-                "gpu",
-                "-b",
-                "1024",
-            ],
-            cwd=CLASSIFIER,
-            check=False,
-        )
-
-        if classifier.returncode != 0:
-            print(f"\nchunk at {i} failed, skipping")
-            continue
-
-        with open(CHUNK_OUT_P, newline="", encoding="utf-8") as chunk_out:
-            classifications = list(csv.reader(chunk_out))[1:]
-
-        with database:
-            for (given, family), classification in zip(
-                chunk_names, classifications
-            ):
-                if float(classification[2]) < MIN_CONFIDENCE:
-                    continue
-                database.execute(
-                    "INSERT OR IGNORE INTO classified_names VALUES (?, ?, ?, ?)",
-                    (
-                        given,
-                        family,
-                        classification[1],
-                        float(classification[2]),
-                    ),
-                )
-
-        print(
-            f"\r{i + CHUNK_SIZE}/{len(names)} classified "
-            f"{time.time() - start:.2f}s",
-            end="",
-            flush=True,
-        )
-
-    print(f"\n{time.time() - start:.2f}s")
-
-
 def mark_processed(database, files):
     """Stores the compressed files whose names have been classified"""
     with database:
@@ -229,7 +161,7 @@ def filter_names(database, ethnicity):
     )
 
 
-def populate_database(ethnicity, path):
+def populate_database(ethnicity, path, classifications_db):
     """Attaches the database and populates it with works of the ethnicity"""
     subprocess.run(
         [
@@ -239,7 +171,7 @@ def populate_database(ethnicity, path):
             "crossref",
             path,
             "--attach-databases",
-            f"attached:{CLASSIFICATIONS_DB}",
+            f"attached:{classifications_db}",
             "--row-selection",
             "EXISTS (SELECT 1 FROM attached.classified_names "
             "WHERE classified_names.given IS work_authors.given "
@@ -253,7 +185,7 @@ def populate_database(ethnicity, path):
 
 def main():
     """
-    Takes arguments <ethnicity> <path of compressed files> [--rebuild]
+    Takes arguments <ethnicity> <path/to/compressed/files> [--rebuild]
     Classifier used is name-ethnicity-classifier
     Names and their predicted ethnicity are stored in classifications.db
     together with the compressed files they were read from
@@ -261,18 +193,28 @@ def main():
     Attach and populate the database using a3k --attach-databases
     Script produces populated tables which can be used for other processes
     """
-    arguments = [
-        argument for argument in sys.argv[1:] if argument != "--rebuild"
-    ]
-    rebuild = "--rebuild" in sys.argv
-
-    if len(arguments) < 2:
-        sys.exit(
-            "usage: filter_ethnicity.py <ethnicity> "
-            "<path containing compressed files> [--rebuild]"
-        )
-
-    ethnicity, path = arguments[0], arguments[1]
+    parser = argparse.ArgumentParser(
+        description="Filter and populate a database "
+        "with authors of one ethnicity"
+    )
+    parser.add_argument(
+        "ethnicity", help="ethnicity to filter, as named by the model"
+    )
+    parser.add_argument(
+        "path", help="directory containing the compressed jsonl files"
+    )
+    parser.add_argument(
+        "--work-dir",
+        default=WORK_DIR,
+        help="where classifications.db and the filtered files are kept",
+    )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="drop classifications.db so every name is classified again",
+    )
+    arguments = parser.parse_args()
+    ethnicity, path = arguments.ethnicity, arguments.path
 
     with open(
         f"{CLASSIFIER}/model_configurations/{MODEL}/nationalities.json",
@@ -286,24 +228,32 @@ def main():
             f"supported: {', '.join(nationalities)}"
         )
 
-    if rebuild and os.path.exists(CLASSIFICATIONS_DB):
-        os.remove(CLASSIFICATIONS_DB)
+    classifications_db = os.path.join(arguments.work_dir, CLASSIFICATIONS_DB)
+    if arguments.rebuild and os.path.exists(classifications_db):
+        os.remove(classifications_db)
 
-    database = create_databases()
+    database = create_databases(arguments.work_dir)
 
     names, read_files = extract_names(path, database)
     names = unclassified(database, names)
-    if names:
-        classify_names(database, names)
+
+    for chunk in classify_names(names):
+        with database:
+            for row in chunk:
+                database.execute(
+                    "INSERT OR IGNORE INTO classified_names VALUES (?, ?, ?, ?)",
+                    row,
+                )
+
     mark_processed(database, read_files)
 
-    greek_names = filter_names(database, ethnicity)
-    print(f"{len(greek_names)} {ethnicity} names")
-    
+    ethnicity_names = filter_names(database, ethnicity)
+    print(f"{len(ethnicity_names)} {ethnicity} names")
 
-    output_p = split_files(ethnicity, greek_names, path)
+    output_p = split_files(ethnicity, ethnicity_names, path, arguments.work_dir)
+    print("")
     print("populating names using a3k")
-    populate_database(ethnicity, output_p)
+    populate_database(ethnicity, output_p, classifications_db)
 
 
 if __name__ == "__main__":
