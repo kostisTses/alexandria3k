@@ -23,13 +23,17 @@ twine = "*"
 
 [examples-packages]
 cliffs_delta = "*"
+datasketch = "*"
 igraph = "*"
 leidenalg = "*"
 matplotlib = "*"
+n2e = "*"
 networkx = "*"
 numpy = "*"
 pandas = "*"
-scipy = "*"
+rapidfuzz = "*"
+scikit-learn = "*"
+scipy = "*
 
 [requires]
 python_version = "3"
