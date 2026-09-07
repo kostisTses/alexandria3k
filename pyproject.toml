@@ -39,9 +39,9 @@ author-disambiguation = [
   "rapidfuzz",
   "datasketch",
   "scikit-learn",
-  "n2e",
 ]
 
+ethnicities = ["n2e"]
 
 [project.urls]
 "Homepage" = "https://github.com/dspinellis/alexandria3k"

@@ -39,6 +39,7 @@ import subprocess
 import gzip
 import json
 import os
+from multiprocessing import Pool
 
 import apsw
 
@@ -110,41 +111,48 @@ def split_files(ethnicity, ethnicity_names, path, work_dir):
     return output_p
 
 
-def extract_names(path, database):
-    """
-    Extracts author names from the compressed files that have not been read
-    Returns the names and the files they were read from
-    """
+def read_file_names(file_path):
     names = set()
+    try:
+        with gzip.open(file_path, "rt", encoding="utf-8") as f:
+            for line in f:
+                work = json.loads(line)
+                for author in work.get("author", []):
+                    given = author.get("given")
+                    family = author.get("family")
+                    if not given or not family:
+                        continue
+                    names.add((given, family))
+    except (gzip.BadGzipFile, EOFError) as error:
+        return os.path.basename(file_path), None, str(error)
+    return os.path.basename(file_path), names, None
+
+
+def extract_names(path, database):
+    processed = processed_files(database)
     jsonl_files = [
-        file
+        file.path
         for file in os.scandir(path)
-        if file.name.endswith(".jsonl.gz")
-        and file.name not in processed_files(database)
+        if file.name.endswith(".jsonl.gz") and file.name not in processed
     ]
 
+    names = set()
     read_files = []
-    for i, file in enumerate(jsonl_files, start=1):
-        try:
-            with gzip.open(file.path, "rt", encoding="utf-8") as f:
-                for line in f:
-                    work = json.loads(line)
-                    for author in work.get("author", []):
-                        given = author.get("given")
-                        family = author.get("family")
-                        if not given or not family:
-                            continue
-                        names.add((given, family))
-        except (gzip.BadGzipFile, EOFError) as error:
-            print(f"\nskipping {file.name}: {error}")
-            continue
-
-        read_files.append(file.name)
-        print(f"\r{i}/{len(jsonl_files)} files loaded", end="", flush=True)
+    with Pool() as pool:
+        for i, (file_name, file_names, error) in enumerate(
+            pool.imap_unordered(read_file_names, jsonl_files), start=1
+        ):
+            if error:
+                print(f"\nskipping {file_name}: {error}")
+                continue
+            names |= file_names
+            read_files.append(file_name)
+            print(
+                f"\r{i}/{len(jsonl_files)} files loaded", end="", flush=True
+            )
 
     print("\nextracted names")
     return names, read_files
-
 
 def unclassified(database, names):
     """Returns the names that are not in classified_names yet"""
