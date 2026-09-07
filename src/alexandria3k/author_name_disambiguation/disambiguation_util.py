@@ -1,15 +1,10 @@
+"""
+Includes all external utilities that are used in the author_name_disambiguation pipeline
+"""
 
-from typing import NamedTuple
 import unicodedata
 
 from sklearn.feature_extraction.text import CountVectorizer
-
-class Author(NamedTuple):
-    """One author mention within a block"""
-    id: int
-    name: str
-    work_id: int
-    community_id: int
 
 
 # Adapted from uf-toolkit (https://github.com/hugginsc10/uf-toolkit)
@@ -19,34 +14,41 @@ class UnionFind:
     """UnionFind datastructure implementation taken from github used for merging authors together"""
 
     def __init__(self, size):
-        self.parent = [i for i in range(size)]
+        "init"
+        self.parent = list(range(size))
         self.rank = [0] * size
 
     def find(self, i):
+        "finds nodes parent"
         if self.parent[i] != i:
             self.parent[i] = self.find(self.parent[i])  # Path compression
         return self.parent[i]
 
     def union(self, a, b):
-        rootA = self.find(a)
-        rootB = self.find(b)
+        "unions two nodes"
+        root_a = self.find(a)
+        root_b = self.find(b)
 
-        if rootA != rootB:
+        if root_a != root_b:
             # Union by rank
-            if self.rank[rootA] < self.rank[rootB]:
-                self.parent[rootA] = rootB
-            elif self.rank[rootA] > self.rank[rootB]:
-                self.parent[rootB] = rootA
+            if self.rank[root_a] < self.rank[root_b]:
+                self.parent[root_a] = root_b
+            elif self.rank[root_a] > self.rank[root_b]:
+                self.parent[root_b] = root_a
             else:
-                self.parent[rootB] = rootA
-                self.rank[rootA] += 1
+                self.parent[root_b] = root_a
+                self.rank[root_a] += 1
+
     def connected(self, a, b):
+        "checks if two nodes are connected"
         return self.find(a) == self.find(b)
 
     def count_sets(self):
+        "counts number of sets"
         return sum(1 for i in range(len(self.parent)) if i == self.parent[i])
 
     def get_set_elements(self, i):
+        "gets all elements of a set"
         root = self.find(i)
         return [x for x in range(len(self.parent)) if self.find(x) == root]
 
@@ -61,10 +63,12 @@ def jaccard_similarity(set_a, set_b):
 
     return jaccard
 
+
 def normalized(s: str):
-    """Custom normalization function used for normalizing author_names """
+    """Custom normalization function used for normalizing author_names"""
     tmp = "".join(
-        c for c in unicodedata.normalize("NFKD", s)
+        c
+        for c in unicodedata.normalize("NFKD", s)
         if unicodedata.category(c) != "Mn" and c.isalpha()
     )
     return tmp.lower().strip()
@@ -72,5 +76,7 @@ def normalized(s: str):
 
 ngram = CountVectorizer(ngram_range=(1, 1)).build_analyzer()
 
+
 def get_ngrams(text):
+    "gets n_grams of a sentence"
     return set(ngram(text))

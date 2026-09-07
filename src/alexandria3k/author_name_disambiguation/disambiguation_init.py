@@ -1,17 +1,6 @@
 """
-Process creates and links author_name_blocks table
-(work_author_id, normalized_name, normalized_family_name, work_id, block_key)
+Handles all the initialisation to set up the author_name_disambiguation pipeline
 
-Takes input work_authors table which gets populated with Crossref metadata
-
-First phase of the author name disambiguation pipeline, called by
-link_disambiguated_authors
-- Gets every author in the populated table
-- Normalizes name with custom function normalize()
-- Groups them on "blocks" based on that normalization function
-  (current grouping logic is normalized_last_name + normalized first name initial)
-
-Output is the filled author_name_blocks table
 """
 
 import time
@@ -23,7 +12,9 @@ import leidenalg
 
 from alexandria3k.common import ensure_table_exists, log_sql, set_fast_writing
 
-from alexandria3k.author_name_disambiguation.disambiguation_util import normalized
+from alexandria3k.author_name_disambiguation.disambiguation_util import (
+    normalized,
+)
 
 # from alexandria3k import perf
 from alexandria3k.db_schema import ColumnMeta, TableMeta
@@ -46,8 +37,14 @@ DEFAULT_RESOLUTION = 1.0
 
 
 def build_communities_graph(database):
-    """Build an igraph graph from the coupling work refrences."""
+    """
+    Builds graph over journals connected by shared doi's
 
+    :param database: The connected database
+    :type database:  Connection
+    :return:         The created graph
+    :rtype:          igraph
+    """
     graph_cursor = database.cursor()
 
     journals = [
@@ -81,7 +78,18 @@ def build_communities_graph(database):
 
 
 def run_leiden_clustering(g, resolution=DEFAULT_RESOLUTION):
-    """Run Leiden clustering and return the partition."""
+    """
+    Runs leiden clustering algorithm on a Graph
+
+    :param g: The graph that runs the algorithm on
+    :type g:  igraph.Graph
+
+    :param resolution: Controls how finely the graph gets split into communities,
+    defaults to DEFAULT_RESOLUTION
+
+    :return: Dict of key:names , value:community_id
+    :rtype:  dict
+    """
     leiden_start = time.perf_counter()
     partition = leidenalg.find_partition(
         g,
@@ -92,7 +100,9 @@ def run_leiden_clustering(g, resolution=DEFAULT_RESOLUTION):
     )
     leiden_end = time.perf_counter()
     n_communities = len(partition)
-    print(f"Found {n_communities} communities in {leiden_end - leiden_start:.2f}s.")
+    print(
+        f"Found {n_communities} communities in {leiden_end - leiden_start:.2f}s."
+    )
 
     community_map = dict(zip(g.vs["name"], partition.membership))
     return community_map
@@ -100,11 +110,16 @@ def run_leiden_clustering(g, resolution=DEFAULT_RESOLUTION):
 
 def get_journal_communities(database):
     """
-    Gets author communities based on bibliographic coupling
+    Finds communities of journals based on bibliographic coupling
     Builds igraph, vertices = journals, edges = journals citing the same doi
     If 2 works from different journals cite the same doi then they are connected
     Runs leiden clustering algorithm to get the communities
     Returns a dictionary of key = journal , value = community_id
+
+    :param database: The database to be queried
+    :type database:  Connection
+    :return:         Dict of key:names , value:community_id
+    :rtype:          dict
     """
     g = build_communities_graph(database)
     community_map = run_leiden_clustering(g)
@@ -117,6 +132,13 @@ def normalized_block(given, family_name):
     If given is missing, block_key = family + initial_family
     If family is missing, block_key = given + initial_given
     Returns a set of (normalized given, normalized_family, block_key)
+
+    :param given:       given name
+    :type given:        str
+    :param family_name: family name
+    :type family_name:  str
+    :return:            set of normalized given and family
+
     """
     normalized_name = normalized(given)
     normalized_family = normalized(family_name)
@@ -129,14 +151,15 @@ def normalized_block(given, family_name):
     elif normalized_name and not normalized_family:
         block_key = normalized_name + "_" + normalized_name[0]
     else:
-        block_key = normalized_family + "_" + normalized_name[0]  # last name + initial
+        block_key = (
+            normalized_family + "_" + normalized_name[0]
+        )  # last name + initial
 
     return (normalized_name, normalized_family, block_key)
 
 
 def create_author_blocks_table(database_path):
-    """Creates the author_blocks_table from the populated dataset.
-    Procedure is mentioned in the comment of the process below"""
+    """Creates the author_blocks_table from the populated dataset."""
 
     database = apsw.Connection(database_path)
     database.execute(log_sql("DROP TABLE IF EXISTS author_name_blocks"))
@@ -147,14 +170,19 @@ def create_author_blocks_table(database_path):
     ensure_table_exists(database, "works")
     # perf.log("author_blocks table created")
 
-    timer = time.perf_counter()
-
     select_cursor = database.cursor()
     insert_cursor = database.cursor()
     # perf.log("author_blocks SELECT")
 
     community_map = get_journal_communities(database)
-    for author_id, given, family_name, work_id, journal in select_cursor.execute("""
+    for (
+        author_id,
+        given,
+        family_name,
+        work_id,
+        journal,
+    ) in select_cursor.execute(
+        """
         SELECT work_authors.id,
                work_authors.given, 
                work_authors.family, 
@@ -162,7 +190,8 @@ def create_author_blocks_table(database_path):
                works.container_title  
         FROM work_authors
         LEFT JOIN works ON works.id = work_authors.work_id
-        """):
+        """
+    ):
         if not given or not family_name:
             continue
 
@@ -198,8 +227,8 @@ def create_author_blocks_table(database_path):
         )
     )
     database.execute(
-        log_sql("CREATE INDEX IF NOT EXISTS idx_work_id ON author_name_blocks(work_id)")
+        log_sql(
+            "CREATE INDEX IF NOT EXISTS idx_work_id ON author_name_blocks(work_id)"
+        )
     )
     # perf.log("created author_blocks indexes")
-
-    print(f"Created author_blocks {time.perf_counter() - timer}")

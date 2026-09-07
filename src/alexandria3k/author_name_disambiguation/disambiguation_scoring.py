@@ -1,39 +1,83 @@
+"""
+Includes all of the classes/methods relative to comparing and scoring two authors,
+based on their similarities
+
+- AuthorAttr class contains information of an author
+- BlockAttr  class contains information about all authors in a block
+- get_*       methods gets all the attributes that are used to compare authors,
+              runs once for all the authors in one block
+
+- score_*     methods score the similarity of the attributes,
+              if avg of all scores exceed a threashold we say they are the same
+
+- check_*     methods are boolean and check for cheap conditions that rules out a match
+
+- compare_authors method is the main caller of all the scoring methods
+"""
+
+from typing import NamedTuple
+
 from datasketch import MinHash
 from rapidfuzz.distance import JaroWinkler
 
 from alexandria3k.author_name_disambiguation.disambiguation_util import (
-    Author,
     get_ngrams,
     jaccard_similarity,
 )
 
 
-class Block_Attr():
+class AuthorAttr(NamedTuple):
+    """One author mention within a block"""
+
+    work_author_id: int
+    name: str
+    work_id: int
+    community_id: int
+
+
+class BlockAttr:
     """Every attribute of a block used to compare authors together"""
+
+    # pylint: disable=too-few-public-methods
+
     def __init__(self, block_key, authors):
         self.block_key = block_key
         self.authors = authors
         self.co_authors = {}
         self.affiliations = {}
         self.publication_years = {}
-        self.venues = {}
+        self.journals = {}
         self.min_hashes = {}
 
     def load(self, database):
+        "loads all attributes of each block"
+
         self.co_authors = get_co_authors(self.block_key, database)
-        self.affiliations = get_affiliations_per_block(self.block_key, database)
-        self.publication_years = get_publication_years_per_block(self.block_key, database)
-        self.venues = get_venue_per_block(self.block_key, database)
+        self.affiliations = get_affiliations_per_block(
+            self.block_key, database
+        )
+        self.publication_years = get_publication_years_per_block(
+            self.block_key, database
+        )
+        self.journals = get_journal_per_block(self.block_key, database)
         self.min_hashes = get_min_hashes(self.co_authors)
 
-def get_min_hashes(co_authors_map: dict[int, set[str]], max_threshold=500, min_authors=10):
+
+def get_min_hashes(co_authors_map: dict[int, set], max_threshold=500):
+    """
+    Calculates min_hash for authors with large co_authors count
+
+    :param co_authors_map: map of co_authors
+    :type co_authors_map:  dict[int, set]
+
+    :param max_threshold:  determines threashold of large co_author count, defaults to 500
+
+    :return:               dict of  key: author_id, value: min_hash
+    """
 
     min_hash_map = {}
 
     if not co_authors_map:
-        return {}
-
-    if len(co_authors_map) < min_authors:
         return {}
 
     max_coauth = max(len(co_authors) for co_authors in co_authors_map.values())
@@ -50,16 +94,25 @@ def get_min_hashes(co_authors_map: dict[int, set[str]], max_threshold=500, min_a
     return min_hash_map
 
 
-def get_co_authors(key, database):
+def get_co_authors(block_key, database):
     """
-    Gets all the co-authors of a specific work of an author and stores in a set
-    Takes everything from the author_names_blocks table
+    Finds all co_authors of each author in a block
+    Stores everything in a dict
+
+    :param block_key: the block_key to be checked
+    :type block_key:  str
+
+    :param database:  the database we are working in
+    :type database:   Connection
+
+    :return: dict of key: work_author_id, value: set of each co_authors block_key
     """
 
     co_authors_cursor = database.cursor()
 
-    # Key: work_author_id , Value: set of block_keys corresponding to their co_authors
-    coauthor_map: dict[int, set[str]] = {}
+    # Key: author_id , Value: set of co_author block_key
+    coauthor_map = {}
+
     for work_author_id, coauthor_block_key in co_authors_cursor.execute(
         """
         SELECT a.work_author_id, b.block_key
@@ -68,7 +121,7 @@ def get_co_authors(key, database):
         WHERE a.block_key = ?
         AND b.work_author_id != a.work_author_id
     """,
-        (key,),
+        (block_key,),
     ):
         if work_author_id not in coauthor_map:
             coauthor_map[work_author_id] = set()
@@ -79,19 +132,22 @@ def get_co_authors(key, database):
 
 def get_affiliations_per_block(block_key, database):
     """
-    Returns a map consisting of all the affiliations of an author_id in a Block,
-    affiliations could be more than one so set is needed,
-    returns the n-gram of each affiliations for better comparisons
-    get_ngrams implemented in author_name_disambiguation_utils.py
-    params:
-        block_key, the block key that we are taking authors from
-        database,  apsw connection of the populated database
+    Finds all affiliations of each author in a block
+    Stores everything in a dict
+    Using n_grams for more precise comparisons
 
+    :param block_key: the block_key to be checked
+    :type block_key:  str
+
+    :param database:  the database we are working in
+    :type database:   Connection
+
+    :return: dict of key: work_author_id, value: set of affiliations
     """
     affiliations_cursor = database.cursor()
 
     # Key: author_id , Value: set of affiliations
-    affiliations_map: dict[int, set[str]] = {}
+    affiliations_map = {}
 
     for author_id, affiliation_name in affiliations_cursor.execute(
         """SELECT author_id, name FROM author_affiliations
@@ -109,13 +165,22 @@ def get_affiliations_per_block(block_key, database):
 
 def get_publication_years_per_block(block_key, database):
     """
-    Queries the database for publication year of the work of each author in a block
+    Finds all publication years of each author in a block
+    Stores everything in a dict
+
+    :param block_key: the block_key to be checked
+    :type block_key:  str
+
+    :param database:  the database we are working in
+    :type database:   Connection
+
+    :return: dict of key: work_author_id, value: publication_year
     """
 
     cursor = database.cursor()
 
     # Key: author_id, Value: publication_year
-    publication_year_map: dict[int, int] = {}
+    publication_year_map = {}
 
     for author_id, published_year in cursor.execute(
         """
@@ -129,16 +194,30 @@ def get_publication_years_per_block(block_key, database):
     return publication_year_map
 
 
-def get_venue_per_block(block_key, database):
+def get_journal_per_block(block_key, database):
     """
-    Queries the database for venue of the work of each author in block
+    Finds all journals of each author in a block
+    Stores everything in a dict
+
+    :param block_key: the block_key to be checked
+    :type block_key:  str
+
+    :param database:  the database we are working in
+    :type database:   Connection
+
+    :return: dict of key: work_author_id, value: set of journals
     """
+
     cursor = database.cursor()
 
-    # Key: author_id, Value: set of venues
-    venue_map: dict[int, set[str]] = {}
+    # Key: author_id, Value: set of journals
+    journal_map = {}
 
-    for work_author_id, container_title, shortened_container_title in cursor.execute(
+    for (
+        work_author_id,
+        container_title,
+        shortened_container_title,
+    ) in cursor.execute(
         """
         SELECT work_author_id, works.container_title, works.short_container_title
         FROM works
@@ -147,24 +226,31 @@ def get_venue_per_block(block_key, database):
         """,
         (block_key,),
     ):
-        venue = container_title or shortened_container_title
-        if not venue:
+        journal = container_title or shortened_container_title
+        if not journal:
             continue
 
-        if work_author_id not in venue_map:
-            venue_map[work_author_id] = set()
-        venue_map[work_author_id].update(get_ngrams(venue))
-    return venue_map
+        if work_author_id not in journal_map:
+            journal_map[work_author_id] = set()
+        journal_map[work_author_id].update(get_ngrams(journal))
+    return journal_map
 
 
-def score_affiliations(auth1, auth2, block):
+def score_affiliations(auth1: AuthorAttr, auth2: AuthorAttr, block: BlockAttr):
     """
-    1-3 word n-gram Jaccard similarity of two authors normalized affiliation strings
-    auth = set(author_id, author_name, author_work_id )
+    Scores n-gram jaccard similarity of two authors affiliation sets
+
+    :param auth1: Author1
+    :type auth1:  AuthorAttr
+    :param auth2: Author2
+    :type auth2:  AuthorAttr
+    :param block: Block
+    :type block:  BlockAttr
+    :return:      Jaccard Similarity score
     """
 
-    author_1_affiliations = block.affiliations.get(auth1.id, set())
-    author_2_affiliations = block.affiliations.get(auth2.id, set())
+    author_1_affiliations = block.affiliations.get(auth1.work_author_id, set())
+    author_2_affiliations = block.affiliations.get(auth2.work_author_id, set())
 
     if not author_1_affiliations or not author_2_affiliations:
         return None
@@ -172,25 +258,47 @@ def score_affiliations(auth1, auth2, block):
     return jaccard_similarity(author_1_affiliations, author_2_affiliations)
 
 
-def score_venue(auth1, auth2, block):
+def score_journals(auth1: AuthorAttr, auth2: AuthorAttr, block: BlockAttr):
     """
-    Word n-gram Jaccard similarity of the venues two authors published in.
+    Scores n-gram jaccard similarity of two authors journals sets
+
+    :param auth1: Author1
+    :type auth1:  AuthorAttr
+    :param auth2: Author2
+    :type auth2:  AuthorAttr
+    :param block: Block
+    :type block:  BlockAttr
+    :return:      Jaccard Similarity score
     """
 
-    author_1_venue = block.venues.get(auth1.id, set())
-    author_2_venue = block.venues.get(auth2.id, set())
+    author_1_journals = block.journals.get(auth1.work_author_id, set())
+    author_2_journals = block.journals.get(auth2.work_author_id, set())
 
-    if not author_1_venue or not author_2_venue:
+    if not author_1_journals or not author_2_journals:
         return None
 
-    return jaccard_similarity(author_1_venue, author_2_venue)
+    return jaccard_similarity(author_1_journals, author_2_journals)
 
 
-def score_coauthors(auth1, auth2, block, weight=1.5):
-    """Jaccard similarity of two authors' co-author block-key sets"""
+def score_coauthors(
+    auth1: AuthorAttr, auth2: AuthorAttr, block: BlockAttr, weight=1.5
+):
+    """
+    Scores jaccard similarity of two authors co_authors sets
+    If co-authors count is too large, calculate min-hash instead
+    This comparison metric is weighted
 
-    auth1_coauthors = block.co_authors.get(auth1.id, set())
-    auth2_coauthors = block.co_authors.get(auth2.id, set())
+    :param auth1: Author1
+    :type auth1:  AuthorAttr
+    :param auth2: Author2
+    :type auth2:  AuthorAttr
+    :param block: Block
+    :type block:  BlockAttr
+    :return:      Jaccard Similarity score
+    """
+
+    auth1_coauthors = block.co_authors.get(auth1.work_author_id, set())
+    auth2_coauthors = block.co_authors.get(auth2.work_author_id, set())
 
     if not auth1_coauthors or not auth2_coauthors:
         return None
@@ -202,12 +310,13 @@ def score_coauthors(auth1, auth2, block, weight=1.5):
     return min(1.0, weight * similarity)
 
 
-def score_name_similarity(auth1, auth2, threshold=0.75):
-    """
-    Score the name similarity of 2 authors normalised_name
-    If the name is the same return 1
-    If name1 != name2 find jaroWinkler similarity
-    if jarowinkler < threshold return 0
+def score_name_similarity(
+    auth1: AuthorAttr, auth2: AuthorAttr, threshold=0.75
+):
+    """ "
+    Scores JaroWinkler name similarity of two author names
+
+    :return: Jarowinkler score
     """
 
     if auth1.name == auth2.name:
@@ -216,41 +325,54 @@ def score_name_similarity(auth1, auth2, threshold=0.75):
 
     return 0 if name_similarity < threshold else name_similarity
 
-def score_min_hash(auth1, auth2, block):
+
+def score_min_hash(auth1: AuthorAttr, auth2: AuthorAttr, block: BlockAttr):
     """
-    Estimated Jaccard of two authors' co-author sets from their MinHash
-    Returns None when the block was not big enough to build them
+    Scores MinHash of two authors if their co_author count is large enough
+
+    :param auth1: Author1
+    :type auth1:  AuthorAttr
+    :param auth2: Author2
+    :type auth2:  AuthorAttr
+    :param block: Block
+    :type block:  BlockAttr
+    :return:      MinHash score
     """
 
-    min_hash1 = block.min_hashes.get(auth1.id)
-    min_hash2 = block.min_hashes.get(auth2.id)
+    min_hash1 = block.min_hashes.get(auth1.work_author_id)
+    min_hash2 = block.min_hashes.get(auth2.work_author_id)
 
     if min_hash1 is None or min_hash2 is None:
         return None
 
     return min_hash1.jaccard(min_hash2)
 
-def check_if_co_authors(auth1, auth2):
+
+def check_if_co_authors(auth1: AuthorAttr, auth2: AuthorAttr) -> bool:
     """
     Checks if 2 authors are co_authors by comparing if work_id is the same
     """
     return auth1.work_id == auth2.work_id
 
 
-def check_communities(auth1, auth2):
-    "Checks if 2 authors are in the same community based on journals"
+def check_communities(auth1: AuthorAttr, auth2: AuthorAttr) -> bool:
+    "Checks if 2 authors are in the same community of journals"
+
     if auth1.community_id is None or auth2.community_id is None:
         return False
     return auth1.community_id != auth2.community_id
 
-def check_year_gap(auth1, auth2, block, max_gap=40):
+
+def check_year_gap(
+    auth1: AuthorAttr, auth2: AuthorAttr, block: BlockAttr, max_gap=40
+) -> bool:
     """
-    Get year gaps where authors made publications
-    If there is a big gap between them they are probably not the same person
+    Checks if two authors year_gap
+    If its large enough consider them different
     """
 
-    year1 = block.publication_years.get(auth1.id)
-    year2 = block.publication_years.get(auth2.id)
+    year1 = block.publication_years.get(auth1.work_author_id)
+    year2 = block.publication_years.get(auth2.work_author_id)
 
     if year1 is None or year2 is None:
         return None
@@ -258,19 +380,31 @@ def check_year_gap(auth1, auth2, block, max_gap=40):
     gap = abs(year1 - year2)
     return gap > max_gap
 
+
 def compare_authors(
-    auth1: Author,
-    auth2: Author,
-    block: Block_Attr,
-    threshold=0.67
+    auth1: AuthorAttr, auth2: AuthorAttr, block: BlockAttr, threshold=0.67
 ):
-    """This will serve as the scoring function to determine if 2 authors are the same person.
-    The scoring function will be calculated based on a couple of criteria:
-    - Jaccard similarity on co-author sets of each author (how many co-authors they have in common)
-    - Jaro Winkler score , comparing the normalized names
-    - Affiliation/venue overlap
+    """
+    Scores a pair of two authors similarity based on:
+    - Jaccard similarity on co-author sets
+    - Jaro Winkler normalized name score
+    - Affiliation overlap
+    - Journal overlap
     - Year gap
-    - Topic overlap using Leiden clustering
+    - Journal community/topic overlap using Leiden clustering
+
+    :param auth1: Auhtor 1
+    :type auth1:  AuthorAttr
+
+    :param auth2: Author 2
+    :type auth2:  AuthorAttr
+
+    :param block: Block
+    :type block:  BlockAttr
+
+    :param threshold: Minimum merging threashold, defaults to 0.67
+
+    :return: Similarity score
     """
 
     if check_communities(auth1, auth2):
@@ -283,7 +417,7 @@ def compare_authors(
     name_similarity = score_name_similarity(auth1, auth2)
     jaccard_affiliations = score_affiliations(auth1, auth2, block)
     jaccard_coauthors = score_coauthors(auth1, auth2, block)
-    jaccard_venue = score_venue(auth1, auth2, block)
+    jaccard_venue = score_journals(auth1, auth2, block)
 
     # calculate confidence score
     scores = [

@@ -1,14 +1,16 @@
 """
-Script to filter and populate database with authors from a specific ethnicity
-Currently name-ethinicity-classifier is being used and needs to be installed
-for it to work
-https://github.com/name-ethnicity-classifier
-Note that this specific classifier works only with .csv files
+Script to filter and populate database with authors from a specific ethnicity,
+works on jsonl.gzip files
 
-Script takes arguments <ethnicity> <path to compressed files> [--rebuild]
+Args: <ethnicity> <path to compressed files>
+      [--work-dir DIR] [--output DB] [--rebuild]
  - "ethnicity" is the particular ethnicity filtered, provided by the model
  - "path to compressed files" is the path consisting the compressed jsonl
    files you want to filter
+ - "--work-dir" is where classifications.db and the filtered files are kept,
+   defaults to $XDG_CACHE_HOME/alexandria3k, or ~/.cache/alexandria3k
+ - "--output" is the name of the database to populate,
+   defaults to <ethnicity>.db in the current directory
  - "--rebuild" drops classifications.db so every name is classified again
 
 You dont need to populate the database into tables to use this script,
@@ -16,10 +18,20 @@ works on compressed files to save disk space
 
 Classifications are kept in classifications.db which holds every name that
 has been classified and every compressed file that has been read, so adding
-files to the dataset only classifies the names that are new
+files to the dataset only classifies the names that are new.
+
+Script produces a directory named <ethnicity>_files and contains compressed jsonl files
+containing only the works with authors of the specific matching ethnicity.
+This helps for the a3k populate part so to scan only the needed entries.
+
+classifications.db and <ethnicity>_files are both stored in working_dir
+(defaults to ~/.cache/alexandria3k)
 
 Script calls a3k --attach-databases so filtered database can be populated
-and used
+and used.
+
+Outputs a database named with --output (defaults to <ethnicity>.db) in current directory.
+Schema is the a3k default schema of "a3k populate crossref"
 """
 
 import argparse
@@ -27,22 +39,22 @@ import subprocess
 import gzip
 import json
 import os
-import sys
 
 import apsw
 
-from alexandria3k.author_name_disambiguation.ethnicity_utils import (
-    CLASSIFIER,
-    MODEL,
+from alexandria3k.author_name_disambiguation.classify import (
     classify_names,
 )
 
-WORK_DIR = "alexandria3k"
+WORK_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+    "alexandria3k",
+)
 CLASSIFICATIONS_DB = "classifications.db"
 CONFIDENCE = 95
 
 
-def create_databases(work_dir):
+def create_tables(work_dir):
     """Opens classifications.db in work_dir, creating its tables when missing"""
     os.makedirs(work_dir, exist_ok=True)
     database = apsw.Connection(os.path.join(work_dir, CLASSIFICATIONS_DB))
@@ -58,7 +70,7 @@ def create_databases(work_dir):
     return database
 
 
-def processed_files(database):
+def processed_files(database) -> list:
     """Returns the names of the compressed files already read"""
     return {
         row[0]
@@ -66,15 +78,18 @@ def processed_files(database):
     }
 
 
+# pylint: disable-next=too-many-locals
 def split_files(ethnicity, ethnicity_names, path, work_dir):
     """Copies works with an author of the ethnicity into their own files"""
     names = set(ethnicity_names)
     output_p = os.path.join(work_dir, f"{ethnicity}_files")
     os.makedirs(output_p, exist_ok=True)
 
-    files = [f.name for f in os.scandir(path) if f.name.endswith(".jsonl.gz")]
+    json_files = [
+        f.name for f in os.scandir(path) if f.name.endswith(".jsonl.gz")
+    ]
 
-    for i, file in enumerate(files):
+    for i, file in enumerate(json_files):
         with (
             gzip.open(f"{path}/{file}", "rt", encoding="utf-8") as f,
             gzip.open(
@@ -89,7 +104,9 @@ def split_files(ethnicity, ethnicity_names, path, work_dir):
                     if (given, family) in names:
                         out.write(jsonl)
                         break
-        print(f"\r{i + 1}/{len(files)} files filtered", end="", flush=True)
+        print(
+            f"\r{i + 1}/{len(json_files)} files filtered", end="", flush=True
+        )
     return output_p
 
 
@@ -99,7 +116,7 @@ def extract_names(path, database):
     Returns the names and the files they were read from
     """
     names = set()
-    files = [
+    jsonl_files = [
         file
         for file in os.scandir(path)
         if file.name.endswith(".jsonl.gz")
@@ -107,11 +124,11 @@ def extract_names(path, database):
     ]
 
     read_files = []
-    for i, file in enumerate(files, start=1):
+    for i, file in enumerate(jsonl_files, start=1):
         try:
             with gzip.open(file.path, "rt", encoding="utf-8") as f:
-                for jsonl in f:
-                    work = json.loads(jsonl)
+                for line in f:
+                    work = json.loads(line)
                     for author in work.get("author", []):
                         given = author.get("given")
                         family = author.get("family")
@@ -123,7 +140,7 @@ def extract_names(path, database):
             continue
 
         read_files.append(file.name)
-        print(f"\r{i}/{len(files)} files loaded", end="", flush=True)
+        print(f"\r{i}/{len(jsonl_files)} files loaded", end="", flush=True)
 
     print("\nextracted names")
     return names, read_files
@@ -161,13 +178,13 @@ def filter_names(database, ethnicity):
     )
 
 
-def populate_database(ethnicity, path, classifications_db):
+def populate_database(ethnicity, path, classifications_db, output):
     """Attaches the database and populates it with works of the ethnicity"""
     subprocess.run(
         [
             "a3k",
             "populate",
-            f"{ethnicity}.db",
+            output,
             "crossref",
             path,
             "--attach-databases",
@@ -183,23 +200,22 @@ def populate_database(ethnicity, path, classifications_db):
     )
 
 
-def main():
+def get_flags():
     """
-    Takes arguments <ethnicity> <path/to/compressed/files> [--rebuild]
-    Classifier used is name-ethnicity-classifier
-    Names and their predicted ethnicity are stored in classifications.db
-    together with the compressed files they were read from
-    --rebuild drops classifications.db so every name is classified again
-    Attach and populate the database using a3k --attach-databases
-    Script produces populated tables which can be used for other processes
+    Handles console arguments
+
+    :return ethnicity str:  ethnicity to filter
+    :return path str:     directory containing the compressed jsonl files
+    :return work_dir str: directory holding classifications.db and the filtered files
+    :return output str:   file path of the database to populate
+    :return classifications_db str:  file path of classifications.db
+    :return bool: whether classifications.db is dropped before classifying
     """
     parser = argparse.ArgumentParser(
         description="Filter and populate a database "
         "with authors of one ethnicity"
     )
-    parser.add_argument(
-        "ethnicity", help="ethnicity to filter, as named by the model"
-    )
+    parser.add_argument("ethnicity", help="ethnicity to filter")
     parser.add_argument(
         "path", help="directory containing the compressed jsonl files"
     )
@@ -209,35 +225,55 @@ def main():
         help="where classifications.db and the filtered files are kept",
     )
     parser.add_argument(
+        "--output",
+        help="file path of the database to populate, "
+        "defaults to <ethnicity>.db in the current directory",
+    )
+    parser.add_argument(
         "--rebuild",
         action="store_true",
         help="drop classifications.db so every name is classified again",
     )
     arguments = parser.parse_args()
-    ethnicity, path = arguments.ethnicity, arguments.path
 
-    with open(
-        f"{CLASSIFIER}/model_configurations/{MODEL}/nationalities.json",
-        encoding="utf-8",
-    ) as f:
-        nationalities = json.load(f)
-
-    if ethnicity not in nationalities:
-        sys.exit(
-            f"unknown ethnicity '{ethnicity}'\n"
-            f"supported: {', '.join(nationalities)}"
-        )
-
+    output = arguments.output or f"{arguments.ethnicity}.db"
     classifications_db = os.path.join(arguments.work_dir, CLASSIFICATIONS_DB)
-    if arguments.rebuild and os.path.exists(classifications_db):
+
+    return (
+        arguments.ethnicity,
+        arguments.path,
+        arguments.work_dir,
+        output,
+        classifications_db,
+        arguments.rebuild,
+    )
+
+
+def main():
+    """
+    Takes arguments <ethnicity> <path/to/compressed/files>
+    [--work-dir DIR] [--output DB] [--rebuild]
+    Classifier used is n2e
+    Names and their predicted ethnicity are stored in classifications.db
+    together with the compressed files they were read from
+    --work-dir holds classifications.db and the filtered files
+    --output is the database to populate
+    --rebuild drops classifications.db so every name is classified again
+    Attach and populate the database using a3k --attach-databases
+    Script produces populated tables which can be used for other processes
+    """
+    ethnicity, path, work_dir, output, classifications_db, rebuild = (
+        get_flags()
+    )
+
+    if rebuild and os.path.exists(classifications_db):
         os.remove(classifications_db)
 
-    database = create_databases(arguments.work_dir)
-
+    database = create_tables(work_dir)
     names, read_files = extract_names(path, database)
-    names = unclassified(database, names)
+    unclassified_names = unclassified(database, names)
 
-    for chunk in classify_names(names):
+    for chunk in classify_names(unclassified_names):
         with database:
             for row in chunk:
                 database.execute(
@@ -250,10 +286,10 @@ def main():
     ethnicity_names = filter_names(database, ethnicity)
     print(f"{len(ethnicity_names)} {ethnicity} names")
 
-    output_p = split_files(ethnicity, ethnicity_names, path, arguments.work_dir)
+    output_p = split_files(ethnicity, ethnicity_names, path, work_dir)
     print("")
     print("populating names using a3k")
-    populate_database(ethnicity, output_p, classifications_db)
+    populate_database(ethnicity, output_p, classifications_db, output)
 
 
 if __name__ == "__main__":

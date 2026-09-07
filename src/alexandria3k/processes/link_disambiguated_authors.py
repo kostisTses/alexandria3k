@@ -1,4 +1,4 @@
-""""Links authors with their predicted disambiguated identity"""
+"""Links authors with their predicted disambiguated identity"""
 
 from itertools import groupby
 from multiprocessing import Pool
@@ -10,14 +10,14 @@ import apsw
 from alexandria3k.common import ensure_table_exists, log_sql, set_fast_writing
 
 from alexandria3k.author_name_disambiguation.disambiguation_util import (
-    Author,
     UnionFind,
 )
 from alexandria3k.author_name_disambiguation.disambiguation_init import (
     create_author_blocks_table,
 )
 from alexandria3k.author_name_disambiguation.disambiguation_scoring import (
-    Block_Attr,
+    AuthorAttr,
+    BlockAttr,
     compare_authors,
 )
 
@@ -35,15 +35,16 @@ table = [
     ),
 ]
 
-def group_by_signature(authors, block: Block_Attr):
+
+def group_by_signature(authors, block: BlockAttr):
     """Groups authors by their (name, co-authors, affiliations, year) signature."""
     groups = {}
     for author in authors:
         signature = (
             author.name,
-            frozenset(block.co_authors.get(author.id, set())),
-            frozenset(block.affiliations.get(author.id, set())),
-            block.publication_years.get(author.id),
+            frozenset(block.co_authors.get(author.work_author_id, set())),
+            frozenset(block.affiliations.get(author.work_author_id, set())),
+            block.publication_years.get(author.work_author_id),
         )
         if signature not in groups:
             groups[signature] = []
@@ -52,6 +53,7 @@ def group_by_signature(authors, block: Block_Attr):
     return groups
 
 
+# pylint: disable-next=too-many-locals
 def process_block(block_key, grouped_authors, database_path, database=None):
     """
     Main loop for comparing each author with every other in the block
@@ -63,21 +65,18 @@ def process_block(block_key, grouped_authors, database_path, database=None):
         database = apsw.Connection(database_path)
 
     disambiguated_authors_list: list[tuple] = []
-    
-    #Author() = set(id , name, work_id)
-    authors = [Author(row[1], row[2], row[3], row[4]) for row in grouped_authors]
 
-    # if block only has one author, skip
-    if len(authors) < 2:
-        author_id = authors[0].id
-        disambiguated_author_id = author_id
-        confidence_score = 1.0
+    authors = [
+        AuthorAttr(
+            work_author_id=row[1],
+            name=row[2],
+            work_id=row[3],
+            community_id=row[4],
+        )
+        for row in grouped_authors
+    ]
 
-        disambiguated_authors_entry = (author_id, disambiguated_author_id, confidence_score)
-        disambiguated_authors_list.append(disambiguated_authors_entry)
-        return disambiguated_authors_list
-    
-    block = Block_Attr(block_key, authors)
+    block = BlockAttr(block_key, authors)
     block.load(database)
 
     # unionfind datastructure for merging
@@ -87,9 +86,9 @@ def process_block(block_key, grouped_authors, database_path, database=None):
     union_find = UnionFind(len(groups))
     scores = [0.0] * len(groups)
 
-    representatives = [groups[signature][0] for signature in groups.keys()]
-    for i, signature in enumerate(groups.keys()):
-        if len(groups[signature]) > 1:
+    representatives = [group[0] for group in groups.values()]
+    for i, group in enumerate(groups.values()):
+        if len(group) > 1:
             scores[i] = 1.0
 
     for i, representative_1 in enumerate(representatives):
@@ -99,9 +98,7 @@ def process_block(block_key, grouped_authors, database_path, database=None):
                 continue
 
             if score := compare_authors(
-                representative_1,
-                representative_2,
-                block
+                representative_1, representative_2, block
             ):
                 union_find.union(i, j)
                 scores[i] = max(scores[i], score)
@@ -109,10 +106,14 @@ def process_block(block_key, grouped_authors, database_path, database=None):
 
     for i, signature in enumerate(groups.keys()):
         root = union_find.find(i)
-        disambiguated_author_id = representatives[root].id
+        disambiguated_author_id = representatives[root].work_author_id
         confidence_score = scores[i]
         for author in groups[signature]:
-            disambiguated_authors_entry = (author.id, disambiguated_author_id, confidence_score)
+            disambiguated_authors_entry = (
+                author.work_author_id,
+                disambiguated_author_id,
+                confidence_score,
+            )
             disambiguated_authors_list.append(disambiguated_authors_entry)
 
     return disambiguated_authors_list
@@ -129,28 +130,54 @@ def process_chunk(chunk, database_path):
         )
     return result
 
-def build_block_args(block_cursor, database_path, big_block_threshold=50):
+
+def ethnicity_query(ethnicity=None):
+    "Query to get specific ethnicity"
+    join = ""
+    where = ""
+    parameters = ()
+    if ethnicity:
+        join = "JOIN author_ethnicities USING (work_author_id, work_id)"
+        where = "WHERE ethnicity = ?"
+        parameters = (ethnicity,)
+
+    query = f"""
+        SELECT block_key, work_author_id, normalized_name, work_id, community_id
+        FROM author_name_blocks
+        {join}
+        {where}
+        ORDER BY block_key
+    """
+    return query, parameters
+
+
+def build_block_args(
+    block_cursor, database_path, big_block_threshold=50, ethinicity=None
+):
     """Builds arguments for each block to be processed"""
+
     big_block_args = []
     small_block_args = []
     single_block_results = []
 
-    query = """SELECT block_key , work_author_id , normalized_name, work_id, community_id
-            FROM author_name_blocks
-            ORDER BY block_key
-        """
+    query, params = ethnicity_query(ethinicity)
+
     for block_key, grouped_authors in groupby(
-        block_cursor.execute(query), key=lambda row: row[0]
+        block_cursor.execute(query, params), key=lambda row: row[0]
     ):
         grouped_authors = list(grouped_authors)
         if len(grouped_authors) < 2:
             work_author_id = grouped_authors[0][1]
-            single_block_results.append([(work_author_id, work_author_id, 1.0)])
+            single_block_results.append(
+                [(work_author_id, work_author_id, 1.0)]
+            )
 
         elif len(grouped_authors) > big_block_threshold:
             big_block_args.append((block_key, grouped_authors, database_path))
         else:
-            small_block_args.append((block_key, grouped_authors, database_path))
+            small_block_args.append(
+                (block_key, grouped_authors, database_path)
+            )
 
     return big_block_args, small_block_args, single_block_results
 
@@ -170,7 +197,9 @@ def process_blocks_parallel(block_cursor, database_path):
     small_block_args = []
     single_block_results = []
 
-    big_block_args, small_block_args, single_block_results = build_block_args(block_cursor, database_path)
+    big_block_args, small_block_args, single_block_results = build_block_args(
+        block_cursor, database_path
+    )
 
     print(f"populated args {time.perf_counter() - mark:.2f}s")
     big_block_args.sort(key=lambda args: len(args[1]), reverse=True)
@@ -208,12 +237,9 @@ def process_blocks_sequential(block_cursor, database_path, database):
     Returns a list of block entries in form of a list of tuples
     """
     args = []
-    query = """SELECT block_key, work_author_id, normalized_name, work_id, community_id
-               FROM author_name_blocks
-               ORDER BY block_key
-            """
+    query, params = ethnicity_query()
     for block_key, grouped_authors in groupby(
-        block_cursor.execute(query), key=lambda row: row[0]
+        block_cursor.execute(query, params), key=lambda row: row[0]
     ):
         grouped_authors = list(grouped_authors)
         args.append((block_key, grouped_authors, database_path))
@@ -227,9 +253,7 @@ def process_blocks_sequential(block_cursor, database_path, database):
     return results
 
 
-def create_disambiguated_authors_table(
-    database_path, parallelised=True
-):
+def create_disambiguated_authors_table(database_path, parallelised=True):
     """Creates and links disambiguated_authors table.
     Takes as input the database path and checks if author_name_blocks table exists
     """
@@ -238,16 +262,19 @@ def create_disambiguated_authors_table(
     database.execute(log_sql("DROP TABLE IF EXISTS disambiguated_authors"))
     database.execute(log_sql(table[0].table_schema()))
 
-
     ensure_table_exists(database, "author_name_blocks")
     ensure_table_exists(database, "author_affiliations")
     ensure_table_exists(database, "work_authors")
     ensure_table_exists(database, "works")
     # perf.log("disambiguated_authors table created")
 
-    database.execute(log_sql("CREATE INDEX IF NOT EXISTS idx_works_id ON works(id)"))
     database.execute(
-        log_sql("CREATE INDEX IF NOT EXISTS idx_work_authors_id ON work_authors(id)")
+        log_sql("CREATE INDEX IF NOT EXISTS idx_works_id ON works(id)")
+    )
+    database.execute(
+        log_sql(
+            "CREATE INDEX IF NOT EXISTS idx_work_authors_id ON work_authors(id)"
+        )
     )
     database.execute(log_sql("""
             CREATE INDEX IF NOT EXISTS idx_author_affiliations_author_id
@@ -261,11 +288,11 @@ def create_disambiguated_authors_table(
     # perf.log("starting block comparison loop")
 
     if parallelised:
-        results = process_blocks_parallel(
-            block_cursor, database_path
-        )
+        results = process_blocks_parallel(block_cursor, database_path)
     else:
-        results = process_blocks_sequential(block_cursor, database_path, database)
+        results = process_blocks_sequential(
+            block_cursor, database_path, database
+        )
 
     set_fast_writing(database)
     for rows in results:
@@ -285,10 +312,14 @@ def process(database_path):
     /alexandria3k/src/alexandria3k/processes/link_author_blocks.py for less comparisons.
     For every entry in a block , compares every pair of authors through a scoring function
     which they will be compared by some criteria mentioned in compare_authors
-    Process will return a table that contains work_author_id , disambiguated_author_id , confidence_score
+    Process will return a table that contains work_author_id ,
+    disambiguated_author_id , confidence_score
     where disambiguated_author_id is the id of the disambiguated author"""
 
+    timer = time.perf_counter()
+
     create_author_blocks_table(database_path)
-    print("Built author-blocks")
+    print(f"Built author-blocks in {time.perf_counter() - timer:2f}s")
+
     create_disambiguated_authors_table(database_path)
-    print("Built author blocks table")
+    print(f"Built author blocks table in {time.perf_counter() - timer:2f}s")
