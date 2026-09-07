@@ -33,7 +33,7 @@ numpy = "*"
 pandas = "*"
 rapidfuzz = "*"
 scikit-learn = "*"
-scipy = "*
+scipy = "*"
 
 [requires]
 python_version = "3"
