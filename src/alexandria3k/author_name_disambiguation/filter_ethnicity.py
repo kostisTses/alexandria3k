@@ -68,6 +68,10 @@ def create_tables(work_dir):
         "ON classified_names(given, family)"
     )
     database.execute("CREATE TABLE IF NOT EXISTS processed_files (file_name)")
+    database.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_processed_file "
+        "ON processed_files(file_name)"
+    )
     return database
 
 
@@ -136,8 +140,6 @@ def extract_names(path, database):
         if file.name.endswith(".jsonl.gz") and file.name not in processed
     ]
 
-    names = set()
-    read_files = []
     with Pool() as pool:
         for i, (file_name, file_names, error) in enumerate(
             pool.imap_unordered(read_file_names, jsonl_files), start=1
@@ -145,34 +147,30 @@ def extract_names(path, database):
             if error:
                 print(f"\nskipping {file_name}: {error}")
                 continue
-            names |= file_names
-            read_files.append(file_name)
-            print(
-                f"\r{i}/{len(jsonl_files)} files loaded", end="", flush=True
-            )
+
+            with database:
+                database.executemany(
+                    "INSERT OR IGNORE INTO classified_names (given, family) "
+                    "VALUES (?, ?)",
+                    file_names,
+                )
+                database.execute(
+                    "INSERT OR IGNORE INTO processed_files VALUES (?)",
+                    (file_name,),
+                )
+            print(f"\r{i}/{len(jsonl_files)} files loaded", end="", flush=True)
 
     print("\nextracted names")
-    return names, read_files
 
-def unclassified(database, names):
-    """Returns the names that are not in classified_names yet"""
-    return [
-        (given, family)
-        for given, family in names
-        if not list(
-            database.execute(
-                "SELECT 1 FROM classified_names WHERE given = ? AND family = ?",
-                (given, family),
-            )
+
+def unclassified(database):
+    """Returns the names that have been extracted but not classified yet"""
+    return list(
+        database.execute(
+            "SELECT given, family FROM classified_names "
+            "WHERE ethnicity IS NULL"
         )
-    ]
-
-
-def mark_processed(database, files):
-    """Stores the compressed files whose names have been classified"""
-    with database:
-        for name in files:
-            database.execute("INSERT INTO processed_files VALUES (?)", (name,))
+    )
 
 
 def filter_names(database, ethnicity):
@@ -278,18 +276,18 @@ def main():
         os.remove(classifications_db)
 
     database = create_tables(work_dir)
-    names, read_files = extract_names(path, database)
-    unclassified_names = unclassified(database, names)
+    extract_names(path, database)
 
-    for chunk in classify_names(unclassified_names):
+    for chunk in classify_names(unclassified(database)):
         with database:
-            for row in chunk:
-                database.execute(
-                    "INSERT OR IGNORE INTO classified_names VALUES (?, ?, ?, ?)",
-                    row,
-                )
-
-    mark_processed(database, read_files)
+            database.executemany(
+                "UPDATE classified_names SET ethnicity = ?, confidence = ? "
+                "WHERE given IS ? AND family IS ?",
+                [
+                    (ethnicity_name, confidence, given, family)
+                    for given, family, ethnicity_name, confidence in chunk
+                ],
+            )
 
     ethnicity_names = filter_names(database, ethnicity)
     print(f"{len(ethnicity_names)} {ethnicity} names")
